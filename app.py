@@ -68,6 +68,8 @@ DEFAULTS = {
     "resolution": 768,
     "repeats": 10,
     "caption_dropout": 0.1,
+    "shuffle_caption": False,
+    "keep_tokens": 0,
     "gpu_index": "0",
     # Advanced
     "optimizer_type": "AdamW8bit",
@@ -198,6 +200,7 @@ def create_training_config(
     timestep_sampling="sigmoid", discrete_flow_shift=1.0,
     cache_latents=True, cache_text_encoder_outputs=True,
     vae_chunk_size=64, vae_disable_cache=True,
+    shuffle_caption=False,
 ) -> str:
     """Generate training TOML and return its path."""
     os.makedirs(output_dir, exist_ok=True)
@@ -239,7 +242,7 @@ def create_training_config(
         "save_precision": "bf16",
         "save_every_n_epochs": int(save_every_n_epochs),
         "save_last_n_epochs": int(save_last_n_epochs),
-        "shuffle_caption": False,
+        "shuffle_caption": bool(shuffle_caption),
         "caption_extension": ".txt",
         "noise_offset": float(noise_offset),
         "multires_noise_discount": float(multires_noise_discount),
@@ -253,7 +256,8 @@ def create_training_config(
 
 
 def create_dataset_config(
-    project_name, image_dir, resolution=768, repeats=5, caption_dropout_rate=0.1
+    project_name, image_dir, resolution=768, repeats=5, caption_dropout_rate=0.1,
+    keep_tokens=0,
 ) -> str:
     """Generate dataset TOML and return its path."""
     current_date = datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -277,6 +281,7 @@ def create_dataset_config(
                         "image_dir": str(image_dir),
                         "caption_extension": ".txt",
                         "caption_dropout_rate": float(caption_dropout_rate),
+                        "keep_tokens": int(keep_tokens),
                     }
                 ],
             }
@@ -296,7 +301,7 @@ def create_dataset_config(
 def configure_training(
     project_name, base_model, image_directory, output_directory,
     network_dim, network_alpha, learning_rate, max_train_epochs,
-    resolution, repeats, caption_dropout, gpu_index_choice,
+    resolution, repeats, caption_dropout, shuffle_caption, keep_tokens, gpu_index_choice,
     # advanced
     optimizer_type, lr_scheduler, lr_scheduler_num_cycles, lr_warmup_steps,
     train_batch_size, gradient_accumulation_steps, max_grad_norm,
@@ -415,6 +420,7 @@ def configure_training(
             cache_text_encoder_outputs=cache_text_encoder_outputs,
             vae_chunk_size=vae_chunk_size,
             vae_disable_cache=vae_disable_cache,
+            shuffle_caption=shuffle_caption,
         )
         dataset_cfg = create_dataset_config(
             project_name=project_name,
@@ -422,6 +428,7 @@ def configure_training(
             resolution=resolution,
             repeats=repeats,
             caption_dropout_rate=caption_dropout,
+            keep_tokens=keep_tokens,
         )
     except Exception as e:
         lines.append(f"❌ Failed to generate configs: {e}")
@@ -443,6 +450,8 @@ def configure_training(
         "resolution": int(resolution),
         "repeats": int(repeats),
         "caption_dropout": float(caption_dropout),
+        "shuffle_caption": bool(shuffle_caption),
+        "keep_tokens": int(keep_tokens),
         "gpu_index": gpu_index_from_choice(gpu_index_choice),
         "optimizer_type": optimizer_type,
         "lr_scheduler": lr_scheduler,
@@ -740,6 +749,18 @@ def build_ui() -> gr.Blocks:
                             step=0.05,
                             value=cfg["caption_dropout"],
                         )
+                    with gr.Row():
+                        shuffle_caption = gr.Checkbox(
+                            label="Shuffle Caption",
+                            value=cfg["shuffle_caption"],
+                        )
+                        keep_tokens = gr.Number(
+                            label="Keep Tokens",
+                            value=cfg["keep_tokens"],
+                            precision=0,
+                            minimum=0,
+                            info="Number of initial tokens to keep when shuffling captions.",
+                        )
 
                 gr.Markdown("---")
                 gr.Markdown("### Config & Training")
@@ -930,7 +951,7 @@ def build_ui() -> gr.Blocks:
         basic_inputs = [
             project_name, base_model_dropdown, image_directory, output_directory,
             network_dim, network_alpha, learning_rate, max_train_epochs,
-            resolution, repeats, caption_dropout, gpu_dropdown,
+            resolution, repeats, caption_dropout, shuffle_caption, keep_tokens, gpu_dropdown,
         ]
 
         # ── Configure Training event ─────────────────────────────────────
