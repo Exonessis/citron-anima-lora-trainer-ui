@@ -59,17 +59,14 @@ DEFAULTS = {
     # Basic
     "project_name": "my_lora",
     "base_model": "anima-base-v1.0",
-    "image_directory": "",
     "output_directory": "",
     "network_dim": 20,
     "network_alpha": 20,
     "learning_rate": 0.0001,
     "max_train_epochs": 10,
     "resolution": 768,
-    "repeats": 10,
-    "caption_dropout": 0.1,
+    "subsets": [{"image_dir": "", "repeats": 10, "keep_tokens": 0, "caption_dropout": 0.1}],
     "shuffle_caption": False,
-    "keep_tokens": 0,
     "gpu_index": "0",
     # Advanced
     "optimizer_type": "AdamW8bit",
@@ -110,6 +107,14 @@ def load_config() -> dict:
             with open(CONFIG_FILE, "r") as f:
                 saved = json.load(f)
             cfg.update({k: v for k, v in saved.items() if k in DEFAULTS})
+            # Backward compat: if no "subsets" key but old per-subset keys exist, convert
+            if not cfg.get("subsets") and saved.get("image_directory"):
+                cfg["subsets"] = [{
+                    "image_dir": saved.get("image_directory", ""),
+                    "repeats": saved.get("repeats", 10),
+                    "keep_tokens": saved.get("keep_tokens", 0),
+                    "caption_dropout": saved.get("caption_dropout", 0.1),
+                }]
         except Exception:
             pass
     return cfg
@@ -256,10 +261,11 @@ def create_training_config(
 
 
 def create_dataset_config(
-    project_name, image_dir, resolution=768, repeats=5, caption_dropout_rate=0.1,
-    keep_tokens=0,
+    project_name, resolution=768, subsets=None,
 ) -> str:
     """Generate dataset TOML and return its path."""
+    if subsets is None:
+        subsets = []
     current_date = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     config_path = CONFIGS_DIR / f"{project_name}_dataset_{current_date}.toml"
 
@@ -275,15 +281,7 @@ def create_dataset_config(
         "datasets": [
             {
                 "resolution": int(resolution),
-                "subsets": [
-                    {
-                        "num_repeats": int(repeats),
-                        "image_dir": str(image_dir),
-                        "caption_extension": ".txt",
-                        "caption_dropout_rate": float(caption_dropout_rate),
-                        "keep_tokens": int(keep_tokens),
-                    }
-                ],
+                "subsets": subsets,
             }
         ],
     }
@@ -299,9 +297,9 @@ def create_dataset_config(
 # ---------------------------------------------------------------------------
 
 def configure_training(
-    project_name, base_model, image_directory, output_directory,
+    project_name, base_model, output_directory,
     network_dim, network_alpha, learning_rate, max_train_epochs,
-    resolution, repeats, caption_dropout, shuffle_caption, keep_tokens, gpu_index_choice,
+    resolution, subsets_df, shuffle_caption, gpu_index_choice,
     # advanced
     optimizer_type, lr_scheduler, lr_scheduler_num_cycles, lr_warmup_steps,
     train_batch_size, gradient_accumulation_steps, max_grad_norm,
@@ -320,48 +318,70 @@ def configure_training(
     # --- Validate inputs ---
     if not project_name.strip():
         return "❌ Project name cannot be empty.", "", ""
-    if not image_directory.strip():
-        return "❌ Image directory cannot be empty.", "", ""
     if not output_directory.strip():
         return "❌ Output directory cannot be empty.", "", ""
 
     lines.append(f"Project:          {project_name}")
-    lines.append(f"Image directory:  {image_directory}")
     lines.append(f"Output directory: {output_directory}")
     lines.append("")
 
-    # --- Validate dataset ---
-    try:
-        n_images, missing, warnings = validate_dataset(image_directory)
-    except (FileNotFoundError, NotADirectoryError) as e:
-        return f"❌ {e}", "", ""
+    # --- Parse subsets from dataframe ---
+    parsed_subsets = []
+    total_weighted_images = 0
+    subset_errors = []
 
-    lines.append(f"Images found:     {n_images}")
-    if missing:
-        lines.append(f"⚠ Missing captions ({len(missing)}):")
-        for m in missing[:20]:
-            lines.append(f"    • {m}")
-        if len(missing) > 20:
-            lines.append(f"    … and {len(missing) - 20} more")
-    else:
-        lines.append("✓ All images have caption files.")
+    for i, row in enumerate(subsets_df):
+        img_dir = str(row[0]).strip() if row and row[0] else ""
+        if not img_dir:
+            continue
+        rep = max(int(row[1]) if row[1] else 1, 1)
+        kt = max(int(row[2]) if row[2] else 0, 0)
+        cd = max(float(row[3]) if row[3] else 0.0, 0.0)
 
-    for w in warnings:
-        lines.append(f"⚠ {w}")
+        try:
+            n_imgs, missing, warnings = validate_dataset(img_dir)
+        except (FileNotFoundError, NotADirectoryError) as e:
+            subset_errors.append(f"Subset #{i + 1}: {e}")
+            continue
 
-    if n_images == 0:
+        total_weighted_images += n_imgs * rep
+        lines.append(f"Subset #{i + 1}: {img_dir}")
+        lines.append(f"  Images: {n_imgs}  Repeats: {rep}  Keep tokens: {kt}  Cap dropout: {cd}")
+        if missing:
+            lines.append(f"  ⚠ Missing captions ({len(missing)}):")
+            for m in missing[:10]:
+                lines.append(f"      • {m}")
+        for w in warnings:
+            lines.append(f"  ⚠ {w}")
+
+        parsed_subsets.append({
+            "num_repeats": rep,
+            "image_dir": img_dir,
+            "caption_extension": ".txt",
+            "caption_dropout_rate": cd,
+            "keep_tokens": kt,
+        })
+
+    if subset_errors:
+        for e in subset_errors:
+            lines.append(f"❌ {e}")
         lines.append("")
-        lines.append("❌ Cannot configure — no images found.")
+        lines.append("❌ Configure failed — fix the errors above.")
+        return "\n".join(lines), "", ""
+
+    if not parsed_subsets:
+        lines.append("")
+        lines.append("❌ No valid subsets configured. Add at least one image directory.")
         return "\n".join(lines), "", ""
 
     # --- Step estimate ---
     batch = max(int(train_batch_size), 1)
     grad = max(int(gradient_accumulation_steps), 1)
-    spe = math.ceil((n_images * int(repeats)) / (batch * grad))
+    spe = math.ceil(total_weighted_images / (batch * grad))
     total = spe * int(max_train_epochs)
     lines.append("")
     lines.append("── Step Estimate ─────────────────────────────────────")
-    lines.append(f"  Steps per epoch: {spe}  ({n_images} imgs × {repeats} repeats)")
+    lines.append(f"  Steps per epoch: {spe}")
     lines.append(f"  Total steps:     {total}  ({spe} × {max_train_epochs} epochs)")
     lines.append("──────────────────────────────────────────────────────")
 
@@ -424,11 +444,8 @@ def configure_training(
         )
         dataset_cfg = create_dataset_config(
             project_name=project_name,
-            image_dir=image_directory,
             resolution=resolution,
-            repeats=repeats,
-            caption_dropout_rate=caption_dropout,
-            keep_tokens=keep_tokens,
+            subsets=parsed_subsets,
         )
     except Exception as e:
         lines.append(f"❌ Failed to generate configs: {e}")
@@ -441,17 +458,14 @@ def configure_training(
     cfg = {
         "project_name": project_name,
         "base_model": base_model,
-        "image_directory": image_directory,
         "output_directory": output_directory,
         "network_dim": int(network_dim),
         "network_alpha": int(network_alpha),
         "learning_rate": float(learning_rate),
         "max_train_epochs": int(max_train_epochs),
         "resolution": int(resolution),
-        "repeats": int(repeats),
-        "caption_dropout": float(caption_dropout),
+        "subsets": parsed_subsets,
         "shuffle_caption": bool(shuffle_caption),
-        "keep_tokens": int(keep_tokens),
         "gpu_index": gpu_index_from_choice(gpu_index_choice),
         "optimizer_type": optimizer_type,
         "lr_scheduler": lr_scheduler,
@@ -638,6 +652,18 @@ def start_training(
 # Gradio UI
 # ---------------------------------------------------------------------------
 
+def _build_initial_subsets(cfg: dict) -> list:
+    """Convert saved config subsets into a 2D list for the Dataframe."""
+    subsets = cfg.get("subsets", [])
+    if subsets:
+        return [
+            [s.get("image_dir", ""), s.get("repeats", 10), s.get("keep_tokens", 0), s.get("caption_dropout", 0.1)]
+            for s in subsets
+        ]
+    # Final fallback
+    return [["", 10, 0, 0.1]]
+
+
 def build_ui() -> gr.Blocks:
     cfg = load_config()
 
@@ -691,11 +717,6 @@ def build_ui() -> gr.Blocks:
                             value=cfg.get("base_model", "anima-base-v1.0"),
                             info="Select Base Model (Model will auto download when you click start training. this may take a few minutes but future runs will not need to download.)",
                         )
-                    image_directory = gr.Textbox(
-                        label="Image Directory (flat folder with images + .txt captions)",
-                        value=cfg["image_directory"],
-                        placeholder="/path/to/my_dataset",
-                    )
                     output_directory = gr.Textbox(
                         label="Output Directory (where trained LoRA is saved)",
                         value=cfg["output_directory"],
@@ -737,31 +758,20 @@ def build_ui() -> gr.Blocks:
                             precision=0,
                             minimum=64,
                         )
-                        repeats = gr.Number(
-                            label="Repeats",
-                            value=cfg["repeats"],
-                            precision=0,
-                            minimum=1,
-                        )
-                        caption_dropout = gr.Slider(
-                            label="Caption Dropout",
-                            minimum=0.0,
-                            maximum=1.0,
-                            step=0.05,
-                            value=cfg["caption_dropout"],
-                        )
-                    with gr.Row():
-                        shuffle_caption = gr.Checkbox(
-                            label="Shuffle Caption",
-                            value=cfg["shuffle_caption"],
-                        )
-                        keep_tokens = gr.Number(
-                            label="Keep Tokens",
-                            value=cfg["keep_tokens"],
-                            precision=0,
-                            minimum=0,
-                            info="Number of initial tokens to keep when shuffling captions.",
-                        )
+                    subsets_df = gr.Dataframe(
+                        headers=["Image Directory", "Repeats", "Keep Tokens", "Caption Dropout"],
+                        datatype=["str", "number", "number", "number"],
+                        value=_build_initial_subsets(cfg),
+                        label="Training Subsets — each row is a concept folder; add more rows for sub-trigger words",
+                        interactive=True,
+                        col_count=(4, "fixed"),
+                        row_count=(1, "dynamic"),
+                        type="array",
+                    )
+                    shuffle_caption = gr.Checkbox(
+                        label="Shuffle Caption",
+                        value=cfg["shuffle_caption"],
+                    )
 
                 gr.Markdown("---")
                 gr.Markdown("### Config & Training")
@@ -950,9 +960,9 @@ def build_ui() -> gr.Blocks:
         ]
 
         basic_inputs = [
-            project_name, base_model_dropdown, image_directory, output_directory,
+            project_name, base_model_dropdown, output_directory,
             network_dim, network_alpha, learning_rate, max_train_epochs,
-            resolution, repeats, caption_dropout, shuffle_caption, keep_tokens, gpu_dropdown,
+            resolution, subsets_df, shuffle_caption, gpu_dropdown,
         ]
 
         # ── Configure Training event ─────────────────────────────────────
