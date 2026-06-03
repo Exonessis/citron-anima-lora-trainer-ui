@@ -502,6 +502,7 @@ def start_training(
     log_lines: list[str] = []
 
     def emit(line: str):
+        print(line, flush=True)
         log_lines.append(line)
         return "\n".join(log_lines)
 
