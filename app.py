@@ -10,6 +10,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from came_pytorch import CAME
 
 import gradio as gr
 import toml
@@ -23,7 +24,10 @@ CONFIGS_DIR = ROOT / "configs"
 LOGS_DIR = ROOT / "logs"
 MODELS_DIR = ROOT / "models" / "anima"
 SD_SCRIPTS_DIR = ROOT / "sd-scripts"
+#CUSTOM_SCHEDULER = ROOT / "backend" / "custom_scheduler"
 
+
+#CUSTOM_OPTIMIZER = CUSTOM_SCHEDULER / "LoraEasyCustomOptimizer"
 DIT_MODEL = MODELS_DIR / "dit" / "anima-preview.safetensors"
 QWEN3_MODEL = MODELS_DIR / "text_encoder" / "qwen_3_06b_base.safetensors"
 VAE_MODEL = MODELS_DIR / "vae" / "qwen_image_vae.safetensors"
@@ -34,7 +38,6 @@ BASE_MODEL_URLS = {
     "anima-preview3-base": "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-preview3-base.safetensors",
     "anima-preview": "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-preview.safetensors"
 }
-
 
 def get_dit_model_path(base_model: str) -> Path:
     """Return the local Path for the selected base model's DiT weights."""
@@ -212,6 +215,23 @@ def create_training_config(
     current_date = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     config_path = CONFIGS_DIR / f"{project_name}_training_{current_date}.toml"
 
+    if optimizer_type.startswith("pytorch_optimizer.CAME"):
+        optimizer_args = [
+            "weight_decay=0.01",
+            "betas=(0.9,0.999,0.9999)",
+            ]
+    elif "Adafactor" in optimizer_type:
+        optimizer_args = [
+            "scale_parameter=False",
+            "relative_step=False",
+            "warmup_init=False",
+        ]
+    else:
+        optimizer_args = [
+            "weight_decay=0.1",
+            "betas=[0.9,0.99]",
+        ]
+
     training_config = {
         "pretrained_model_name_or_path": str(dit_model_path),
         "qwen3": str(qwen3_model_path),
@@ -222,7 +242,7 @@ def create_training_config(
         "network_train_unet_only": True,
         "learning_rate": float(learning_rate),
         "optimizer_type": optimizer_type,
-        "optimizer_args": ["weight_decay=0.1", "betas=[0.9, 0.99]"],
+        "optimizer_args": optimizer_args,
         "lr_scheduler": lr_scheduler,
         "lr_scheduler_num_cycles": int(lr_scheduler_num_cycles),
         "lr_warmup_steps": int(lr_warmup_steps),
@@ -815,7 +835,7 @@ def build_ui() -> gr.Blocks:
                     with gr.Row():
                         optimizer_type = gr.Dropdown(
                             label="Optimizer",
-                            choices=["AdamW8bit", "AdamW", "Lion", "SGD", "Prodigy"],
+                            choices=["AdamW8bit", "AdamW", "Lion", "SGD", "Prodigy", "pytorch_optimizer.CAME"],
                             value=cfg["optimizer_type"],
                         )
                         lr_scheduler = gr.Dropdown(
@@ -827,6 +847,7 @@ def build_ui() -> gr.Blocks:
                                 "constant",
                                 "constant_with_warmup",
                                 "polynomial",
+                                "pytorch_optimizer.CosineAnnealingWarmupRestarts",
                             ],
                             value=cfg["lr_scheduler"],
                         )
